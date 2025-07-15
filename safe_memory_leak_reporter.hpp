@@ -170,4 +170,16 @@ private:
 // 在全局析构期间设置标志 / Set flag during global destruction
 std::atomic<bool> SafeMemoryLeakReporter::in_global_destruction { false };
 
+/// @brief 全局析构监视器 / Monitor for global destruction
+class AtExitDestructionMonitor
+{
+public:
+	~AtExitDestructionMonitor()
+	{
+		SafeMemoryLeakReporter::in_global_destruction = true;
+	}
+};
+
+static AtExitDestructionMonitor global_destruction_monitor;	 //!< 全局实例，用于监视析构 / Global instance to monitor destruction
+
 #endif	// SAFE_MEMORY_LEAK_REPORTER_HPP

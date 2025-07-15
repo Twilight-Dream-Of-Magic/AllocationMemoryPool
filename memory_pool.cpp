@@ -4,14 +4,14 @@
 std::atomic<bool> MemoryPool::construction_warning_shown { false };
 
 /* -------- TLS 实例 -------- */
-thread_local MemoryPool::SmallMemoryManager::ThreadLocalCache MemoryPool::SmallMemoryManager::thread_local_cache;
+thread_local SmallMemoryManager::ThreadLocalCache SmallMemoryManager::thread_local_cache;
 
 /* =====================================================================
  *  SmallMemoryManager — 实现
  * ===================================================================== */
 
 /* -------- allocate -------- */
-void* MemoryPool::SmallMemoryManager::allocate( std::size_t bytes )
+void* SmallMemoryManager::allocate( std::size_t bytes, std::size_t alignment = sizeof( std::max_align_t ) )
 {
 	const std::size_t index = calculate_bucket_index( bytes );	// 计算桶索引 / Calculate bucket index
 	const std::size_t bucket_bytes = BUCKET_SIZES[ index ];		// 获取桶大小 / Get bucket size
@@ -60,24 +60,24 @@ void* MemoryPool::SmallMemoryManager::allocate( std::size_t bytes )
 	const std::size_t block_bytes = sizeof( SmallMemoryHeader ) + bucket_bytes;
 	const std::size_t chunk_size = std::max<std::size_t>( 1 * 1024 * 1024, block_bytes * 128 );	 // 最大值 / Max size
 
-	void* chunk_mem;
+	void* chunk_memory;
 	{
-		std::lock_guard<std::mutex> this_lock_guard( chunk_mutex );  // 加锁保护 / Lock protection
-		chunk_mem = os_memory::allocate_memory( chunk_size );
-		if ( !chunk_mem )
+		std::scoped_lock<std::mutex> lock( chunk_mutex );  // 加锁保护 / Lock protection
+		chunk_memory = os_memory::allocate_tracked( chunk_size, alignment );
+		if ( !chunk_memory )
 			throw std::bad_alloc();	 // 申请失败抛出异常 / Throw exception on failure
-		allocated_chunks.emplace_back( chunk_mem, chunk_size );
+		allocated_chunks.emplace_back( chunk_memory, chunk_size );
 	}
 
 	/* 切分 chunk / Split chunk */
 	const std::size_t block_count = chunk_size / block_bytes;
 	if ( block_count == 0 )
 	{
-		os_memory::deallocate_memory( chunk_mem, chunk_size );	// 释放内存 / Deallocate memory
-		throw std::bad_alloc();									// 申请失败抛出异常 / Throw exception on failure
+		os_memory::deallocate_tracked( chunk_memory, chunk_size );	// 释放内存 / Deallocate memory
+		throw std::bad_alloc();										// 申请失败抛出异常 / Throw exception on failure
 	}
 
-	char*			   cursor = static_cast<char*>( chunk_mem );
+	char*			   cursor = static_cast<char*>( chunk_memory );
 	SmallMemoryHeader* first_block = nullptr;
 	SmallMemoryHeader* previous_block = nullptr;
 
@@ -113,7 +113,7 @@ void* MemoryPool::SmallMemoryManager::allocate( std::size_t bytes )
 		}
 #else
 		std::lock_guard<std::mutex> lock( bucket.mutex );  // 加锁保护 / Lock protection
-		prev_block->next = bucket.head.load( std::memory_order_relaxed );
+		previous_block->next = bucket.head.load( std::memory_order_relaxed );
 		bucket.head.store( first_block, std::memory_order_relaxed );  // 更新头指针 / Update head pointer
 #endif
 	}
@@ -132,35 +132,40 @@ void* MemoryPool::SmallMemoryManager::allocate( std::size_t bytes )
 }
 
 /* -------- deallocate -------- */
-void MemoryPool::SmallMemoryManager::deallocate( SmallMemoryHeader* header )
+void SmallMemoryManager::deallocate( SmallMemoryHeader* header )
 {
 	bool expected = false;
 	if ( !header->is_free.compare_exchange_strong( expected, true, std::memory_order_release, std::memory_order_relaxed ) )
 		return;	 // 双重释放 / Double free
+
+	if ( header->in_tls )  // ★ 新增：检测双重回收
+	{
+		return;
+	}
 
 	if ( header->magic != SmallMemoryHeader::MAGIC )
 	{
 		std::cerr << "[Small] invalid magic during deallocation\n";	 // 魔法值错误 / Invalid magic value
 		return;
 	}
-	header->magic = 0;	// 防止重复使用 / Prevent reuse
+	header->magic = 0;	 // 防止重复使用 / Prevent reuse
+	header->in_tls = 1;	 // ★ 标记“已进 TLS”——放最前
 
 	const std::size_t index = header->bucket_index;
-
 	header->next = thread_local_cache.buckets[ index ];
 	thread_local_cache.buckets[ index ] = header;
 
-	if ( ++thread_local_cache.deallocation_counter >= 256 )	 // [FIX] 阈值放宽 / Threshold relaxed
+	if ( ++thread_local_cache.deallocation_counter >= 256 )
 		flush_thread_local_cache();
 }
 
 
 /* -------- flush TLS -------- */
-void MemoryPool::SmallMemoryManager::flush_thread_local_cache()
+void SmallMemoryManager::flush_thread_local_cache()
 {
 	for ( std::size_t i = 0; i < BUCKET_COUNT; ++i )
 	{
-		SmallMemoryHeader* local_head = thread_local_cache.buckets[ i ];  // 获取线程本地缓存头部 / Get thread-local cache head
+		SmallMemoryHeader* local_head = std::exchange( thread_local_cache.buckets[ i ], nullptr );	// 获取线程本地缓存头部 / Get thread-local cache head
 		if ( !local_head )
 			continue;
 
@@ -185,20 +190,25 @@ void MemoryPool::SmallMemoryManager::flush_thread_local_cache()
 			bucket.head.store( local_head, std::memory_order_relaxed );	 // 更新全局链表头 / Update global list head
 		}
 #endif
+
+		/* 清 in_tls 标记 */
+		for ( SmallMemoryHeader* node = local_head; node; node = node->next )
+			node->in_tls = 0;
+
 		thread_local_cache.buckets[ i ] = nullptr;	// 清空线程本地缓存 / Clear thread-local cache
 	}
 	thread_local_cache.deallocation_counter = 0;  // 重置释放计数器 / Reset deallocation counter
 }
 
 /* -------- release_resources -------- */
-void MemoryPool::SmallMemoryManager::release_resources()
+void SmallMemoryManager::release_resources()
 {
 	flush_thread_local_cache();	 // 清空线程本地缓存 / Clear thread-local cache
 
-	std::lock_guard<std::mutex> this_lock_guard( chunk_mutex );  // 加锁保护 / Lock protection
+	std::lock_guard<std::mutex> this_lock_guard( chunk_mutex );	 // 加锁保护 / Lock protection
 	for ( auto& [ pointer, size ] : allocated_chunks )
-		os_memory::deallocate_memory( pointer, size );	// 释放已分配的内存 / Deallocate allocated memory
-	allocated_chunks.clear();							// 清空已分配块 / Clear allocated chunks
+		os_memory::deallocate_tracked( pointer, size );	 // 释放已分配的内存 / Deallocate allocated memory
+	allocated_chunks.clear();							 // 清空已分配块 / Clear allocated chunks
 
 	for ( auto& bucket : global_buckets )
 	{
@@ -215,38 +225,85 @@ void MemoryPool::SmallMemoryManager::release_resources()
  * ===================================================================== */
 
 /*──────────────── allocate ────────────────*/
-void* MemoryPool::MediumMemoryManager::allocate( std::size_t bytes )
+void* MediumMemoryManager::allocate( std::size_t bytes, std::size_t alignment = sizeof( std::max_align_t ) )
 {
 	const int want_order = order_from_size( bytes );  // 获取所需的内存块级别 / Get the required block level
 
-	/* 1) 在同级或更高级别寻找空闲块 / Look for free blocks at the same level or higher */
+	// 边界检查：确保请求的order在有效范围内
+	if ( want_order < 0 || want_order >= LEVEL_COUNT )
+	{
+		throw std::bad_alloc();
+	}
+
+	/* 第一阶段：常规分配尝试 */
 	for ( int current_order = want_order; current_order < LEVEL_COUNT; ++current_order )
 	{
 		if ( auto* block = pop_block( current_order ) )
 		{
-			// 向下切分到目标级别 / Split down to the target level
 			if ( current_order > want_order )
+			{
 				block = split_to_order( block, current_order, want_order );
-
-			block->is_free.store( false, std::memory_order_relaxed );  // 标记为已分配 / Mark as allocated
-			block->magic = MediumMemoryHeader::MAGIC;				   // 设置魔法值 / Set magic value
-			block->block_size = size_from_order( want_order );		   // 设置块大小 / Set block size
-			block->next = nullptr;
-
-			return block->data();  // 返回数据指针 / Return data pointer
+			}
+			prepare_block( block, want_order );
+			return block->data();
 		}
 	}
 
-	/* 2) 无可用块 —— 申请新 chunk，再尝试一次 / No available blocks — request a new chunk and try again */
-	auto* fresh = request_new_chunk( want_order );
+	/* 第二阶段：申请新chunk */
+	auto* fresh = request_new_chunk( want_order, alignment );
 	if ( !fresh )
-		throw std::bad_alloc();	 // 如果申请失败，抛出异常 / Throw exception if allocation fails
+		throw std::bad_alloc();
 
-	return fresh->data();  // 返回数据指针 / Return data pointer
+	// 占用检测：统计非空级别数量
+	size_t occupied_levels = 0;
+	for ( int i = 0; i < LEVEL_COUNT; i++ )
+	{
+		if ( free_lists[ i ].head.load( std::memory_order_acquire ).pointer )
+		{
+			occupied_levels++;
+		}
+	}
+
+	const uint16_t mask = free_list_level_mask.load( std::memory_order_acquire );
+
+	// 策略选择
+	if ( mask != 0 )
+	{
+		/* 情况1：系统中有可用块 - 资源回收优先 */
+		push_block( fresh, want_order );  // 将新块加入资源池
+
+		// 重新尝试分配，利用可能的新资源
+		for ( int current_order = want_order; current_order < LEVEL_COUNT; ++current_order )
+		{
+			if ( auto* block = pop_block( current_order ) )
+			{
+				if ( current_order > want_order )
+				{
+					block = split_to_order( block, current_order, want_order );
+				}
+				prepare_block( block, want_order );
+				return block->data();
+			}
+		}
+	}
+	else
+	{
+		/* 情况2：系统完全干涸 - 直接使用新资源 */
+		if ( want_order < LEVEL_COUNT - 1 )
+		{
+			// 仅当需要时才分割
+			fresh = split_to_order( fresh, want_order, want_order );
+		}
+		prepare_block( fresh, want_order );
+		return fresh->data();
+	}
+
+	// 终极保障
+	throw std::bad_alloc();
 }
 
 /*──────────────── deallocate ────────────────*/
-void MemoryPool::MediumMemoryManager::deallocate( MediumMemoryHeader* header )
+void MediumMemoryManager::deallocate( MediumMemoryHeader* header )
 {
 	/* 确保不是重复释放 / Ensure no double free */
 	bool expected = false;
@@ -289,7 +346,15 @@ void MemoryPool::MediumMemoryManager::deallocate( MediumMemoryHeader* header )
 }
 
 /*──────────────── 内部工具实现 ────────────────*/
-void MemoryPool::MediumMemoryManager::push_block( MediumMemoryHeader* header, int order )
+inline void MediumMemoryManager::prepare_block( MediumMemoryHeader* block, int order )
+{
+	block->is_free.store( false, std::memory_order_relaxed );
+	block->magic = MediumMemoryHeader::MAGIC;
+	block->block_size = size_from_order( order );
+	block->next = nullptr;
+}
+
+void MediumMemoryManager::push_block( MediumMemoryHeader* header, int order )
 {
 	header->next = nullptr;
 	header->is_free.store( true, std::memory_order_relaxed );  // 标记为可用 / Mark as free
@@ -302,9 +367,17 @@ void MemoryPool::MediumMemoryManager::push_block( MediumMemoryHeader* header, in
 		header->next = head.pointer;  // 将当前块链接到链表头 / Link the current block to the list head
 		PointerTag new_head { header, head.tag + 1 };
 	} while ( !list.head.compare_exchange_weak( head, { header, head.tag + 1 }, std::memory_order_release, std::memory_order_relaxed ) );
+
+	// 原子更新位掩码
+	uint16_t current_mask = free_list_level_mask.load( std::memory_order_relaxed );
+	uint16_t new_mask;
+	do
+	{
+		new_mask = current_mask | ( 1 << order );  // 设置该级别位
+	} while ( !free_list_level_mask.compare_exchange_weak( current_mask, new_mask, std::memory_order_release, std::memory_order_relaxed ) );
 }
 
-MediumMemoryHeader* MemoryPool::MediumMemoryManager::pop_block( int order )
+MediumMemoryHeader* MediumMemoryManager::pop_block( int order )
 {
 	auto&	   list = free_lists[ order ];	// 获取空闲链表 / Get free list for the order
 	PointerTag head = list.head.load( std::memory_order_acquire );
@@ -312,20 +385,44 @@ MediumMemoryHeader* MemoryPool::MediumMemoryManager::pop_block( int order )
 	while ( head.pointer )
 	{
 		PointerTag next { head.pointer->next, head.tag + 1 };
+
+		//Try CompreAndSwap
 		if ( list.head.compare_exchange_weak( head, next, std::memory_order_acq_rel, std::memory_order_acquire ) )
-			return head.pointer;  // 返回空闲块 / Return the free block
+		{
+			// 成功取出一个块，检查取出后链表是否为空
+			if ( next.pointer == nullptr )
+			{
+				// 链表变空，清除掩码位
+				uint16_t current_mask = free_list_level_mask.load( std::memory_order_relaxed );
+				uint16_t new_mask;
+				do
+				{
+					new_mask = current_mask & ~( 1 << order );
+				} while ( !free_list_level_mask.compare_exchange_weak( current_mask, new_mask, std::memory_order_release, std::memory_order_relaxed ) );
+			}
+			return head.pointer;
+		}
+		// CompreAndSwap Failed, Retry
 	}
 
-	return nullptr;	 // 如果没有空闲块，返回空指针 / Return nullptr if no free blocks
+	// 链表已经为空，确保掩码位被清除
+	uint16_t current_mask = free_list_level_mask.load( std::memory_order_relaxed );
+	uint16_t new_mask;
+	do
+	{
+		new_mask = current_mask & ~( 1 << order );
+	} while ( !free_list_level_mask.compare_exchange_weak( current_mask, new_mask, std::memory_order_release, std::memory_order_relaxed ) );
+
+	return nullptr;
 }
 
 /*──────────────── process_merge_queue ────────────────*/
-void MemoryPool::MediumMemoryManager::process_merge_queue()
+void MediumMemoryManager::process_merge_queue()
 {
 	while ( true )
 	{
-		std::size_t cycle_queue_head = merge_queue.head.load( std::memory_order_relaxed );	 // 获取队列头 / Get the queue head
-		std::size_t cycle_queue_tail = merge_queue.tail.load( std::memory_order_acquire );	 // 获取队列尾 / Get the queue tail
+		std::size_t cycle_queue_head = merge_queue.head.load( std::memory_order_relaxed );	// 获取队列头 / Get the queue head
+		std::size_t cycle_queue_tail = merge_queue.tail.load( std::memory_order_acquire );	// 获取队列尾 / Get the queue tail
 
 		// 队列为空 / If the queue is empty
 		if ( cycle_queue_head == cycle_queue_tail )
@@ -352,18 +449,18 @@ void MemoryPool::MediumMemoryManager::process_merge_queue()
 }
 
 /*──────────────── try_merge_buddy ────────────────*/
-void MemoryPool::MediumMemoryManager::try_merge_buddy( MediumMemoryHeader* block, int order )
+void MediumMemoryManager::try_merge_buddy( MediumMemoryHeader* block, int order )
 {
 	// 查找chunk的逻辑（与原始merge_buddy相同）/ Logic for finding the chunk (same as original merge_buddy)
 	void*		chunk_base = nullptr;
 	std::size_t chunk_bytes = 0;
-	for ( auto const& rec : allocated_chunks )
+	for ( auto const& chunk : allocated_chunks )
 	{
-		char* base = static_cast<char*>( rec.first );
-		if ( reinterpret_cast<char*>( block ) >= base && reinterpret_cast<char*>( block ) < base + rec.second )
+		char* base = static_cast<char*>( chunk.first );
+		if ( reinterpret_cast<char*>( block ) >= base && reinterpret_cast<char*>( block ) < base + chunk.second )
 		{
 			chunk_base = base;
-			chunk_bytes = rec.second;
+			chunk_bytes = chunk.second;
 			break;
 		}
 	}
@@ -373,12 +470,17 @@ void MemoryPool::MediumMemoryManager::try_merge_buddy( MediumMemoryHeader* block
 	/* 尝试合并伙伴 / Try to merge buddy */
 	while ( order < LEVEL_COUNT - 1 )
 	{
+		// 计算当前块在chunk中的偏移量 / Calculate block's offset within the chunk
 		std::uintptr_t offset = reinterpret_cast<char*>( block ) - static_cast<char*>( chunk_base );
+		
+		// 使用XOR计算伙伴块的偏移量 / Calculate buddy's offset using XOR trick
 		std::uintptr_t buddy_offset = offset ^ ( size_from_order( order ) );
 
+		// 检查伙伴块是否超出chunk边界 / Check if buddy exceeds chunk boundary
 		if ( buddy_offset + size_from_order( order ) > chunk_bytes )
 			break;	// buddy 超出 chunk / Buddy exceeds chunk size
 
+		// 获取伙伴块头部指针 / Get buddy block header pointer
 		auto* buddy = reinterpret_cast<MediumMemoryHeader*>( static_cast<char*>( chunk_base ) + buddy_offset );
 
 		// 使用原子操作检查buddy状态 / Use atomic operation to check buddy state
@@ -412,7 +514,7 @@ void MemoryPool::MediumMemoryManager::try_merge_buddy( MediumMemoryHeader* block
 }
 
 /*──────────────── try_remove_from_freelist ────────────────*/
-bool MemoryPool::MediumMemoryManager::try_remove_from_freelist( MediumMemoryHeader* header, int order )
+bool MediumMemoryManager::try_remove_from_freelist( MediumMemoryHeader* header, int order )
 {
 	auto&	   list = free_lists[ order ];	// 获取对应级别的空闲链表 / Get the corresponding free list for the order
 	PointerTag head = list.head.load( std::memory_order_acquire );
@@ -421,7 +523,24 @@ bool MemoryPool::MediumMemoryManager::try_remove_from_freelist( MediumMemoryHead
 	{
 		if ( head.pointer == header )
 		{
+			// =====================================================
+			// 场景1: 目标块是链表头节点 / Scenario 1: Target is the head
+			// =====================================================
+
 			PointerTag next { header->next, head.tag + 1 };
+
+			// 尝试原子性地替换链表头 / Attempt atomic head replacement
+			/*
+			 * 使用CAS解决ABA问题：
+			 * - 比较当前head和之前加载的head
+			 * - 如果相同，替换为new_head
+			 * - 如果不同，重试
+			 * 
+			 * CAS solves ABA problem:
+			 * - Compare current head with previously loaded head
+			 * - If same, replace with new_head
+			 * - If different, retry
+			 */
 			if ( list.head.compare_exchange_weak( head, { header, head.tag + 1 }, std::memory_order_acq_rel, std::memory_order_acquire ) )
 			{
 				return true;  // 成功移除 / Successfully removed
@@ -429,14 +548,29 @@ bool MemoryPool::MediumMemoryManager::try_remove_from_freelist( MediumMemoryHead
 		}
 		else
 		{
+			// =====================================================
+			// 场景2: 目标块在链表中间 / Scenario 2: Target is in list middle
+			// =====================================================
+
 			// 遍历链表查找 / Traverse the list to find
 			MediumMemoryHeader* current = head.pointer;
 			while ( current )
 			{
 				if ( current == header )
 				{
-					// 找到后尝试移除 / Found, attempt to remove
 					PointerTag new_head { head.pointer, head.tag + 1 };
+
+					// 尝试原子性地更新链表头 / Attempt atomic head update
+					/*
+					 * 为什么更新链表头？ 
+					 * 在无锁链表中，中间节点移除非常复杂。这里使用简化策略：
+					 * 通过修改链表头标签强制其他线程重试，间接使目标块"失效"
+					 * 
+					 * Why update list head?
+					 * Removing middle nodes in lock-free lists is complex.
+					 * Simplified strategy: Force other threads to retry by
+					 * changing head tag, indirectly "invalidating" target
+					 */
 					if ( list.head.compare_exchange_weak( head, new_head, std::memory_order_acq_rel, std::memory_order_acquire ) )
 					{
 						return true;  // 成功移除 / Successfully removed
@@ -450,11 +584,17 @@ bool MemoryPool::MediumMemoryManager::try_remove_from_freelist( MediumMemoryHead
 	}
 }
 
-MediumMemoryHeader* MemoryPool::MediumMemoryManager::split_to_order( MediumMemoryHeader* block, int from_order, int to_order )
+MediumMemoryHeader* MediumMemoryManager::split_to_order( MediumMemoryHeader* block, int from_order, int to_order )
 {
-	for ( int ord = from_order - 1; ord >= to_order; --ord )
+	// 确保目标order在有效范围内
+	if ( to_order < 0 || to_order >= LEVEL_COUNT || to_order > from_order )
 	{
-		std::size_t half = size_from_order( ord );							  // 计算每个块的一半 / Calculate half of the block size
+		return block;
+	}
+
+	for ( int current_order = from_order - 1; current_order >= to_order; --current_order )
+	{
+		std::size_t half = size_from_order( current_order );				  // 计算每个块的一半 / Calculate half of the block size
 		char*		right_pointer = reinterpret_cast<char*>( block ) + half;  // 获取右侧块的位置 / Get the position of the right block
 
 		auto* right_header = reinterpret_cast<MediumMemoryHeader*>( right_pointer );  // 获取右侧块的头部 / Get the header of the right block
@@ -463,19 +603,19 @@ MediumMemoryHeader* MemoryPool::MediumMemoryManager::split_to_order( MediumMemor
 		right_header->magic = MediumMemoryHeader::MAGIC;							  // 设置魔法值 / Set magic value
 		right_header->next = nullptr;												  // 设置下一块为空 / Set next to null
 
-		push_block( right_header, ord );  // 将右侧块推入空闲链表 / Push the right block into the free list
-		block->block_size = half;		  // 更新原块的大小 / Update the original block's size
+		push_block( right_header, current_order );	// 将右侧块推入空闲链表 / Push the right block into the free list
+		block->block_size = half;					// 更新原块的大小 / Update the original block's size
 	}
 	return block;  // 返回原块 / Return the original block
 }
 
-MediumMemoryHeader* MemoryPool::MediumMemoryManager::request_new_chunk( int min_order )
+MediumMemoryHeader* MediumMemoryManager::request_new_chunk( int min_order, std::size_t alignment = sizeof( std::max_align_t ) )
 {
-	std::lock_guard<std::mutex> this_lock_guard( chunk_mutex );  // 加锁保护 / Lock protection
+	std::lock_guard<std::mutex> this_lock_guard( chunk_mutex );	 // 加锁保护 / Lock protection
 
 	// 计算需要的内存块大小 / Calculate the required chunk size
-	const std::size_t chunk_bytes = size_from_order( min_order );				 // 使用 min_order 来计算内存块大小 / Use min_order to calculate the chunk size
-	void*			  chunk_memory = os_memory::allocate_memory( chunk_bytes );	 // 向操作系统请求内存 / Request memory from the OS
+	const std::size_t chunk_bytes = size_from_order( min_order );							 // 使用 min_order 来计算内存块大小 / Use min_order to calculate the chunk size
+	void*			  chunk_memory = os_memory::allocate_tracked( chunk_bytes, alignment );	 // 向操作系统请求内存 / Request memory from the OS
 	if ( !chunk_memory )
 		return nullptr;	 // 申请失败，返回空指针 / Return null if allocation fails
 
@@ -488,38 +628,31 @@ MediumMemoryHeader* MemoryPool::MediumMemoryManager::request_new_chunk( int min_
 	header->magic = MediumMemoryHeader::MAGIC;				   // 设置魔法值 / Set magic value
 	header->next = nullptr;									   // 设置下一块为空 / Set next to null
 
-	// 直接使用 min_order 来设置 top_order，确保内存块符合请求的级别 / Directly set top_order using min_order to ensure the chunk matches the requested level
-	int top_order = min_order;
-	push_block( header, top_order );  // 推入相应级别的空闲链表 / Push into the free list at the corresponding level
-
-	// 再弹出可满足请求的块 / Pop a block that meets the request
-	return pop_block( min_order );	// 确保使用 min_order 进行 pop / Ensure the block popped meets min_order
+	return header;
 }
 
 /*──────────────── release_resources ────────────────*/
-void MemoryPool::MediumMemoryManager::release_resources()
+void MediumMemoryManager::release_resources()
 {
 	/* 清空 freelist / Clear the freelist */
-	for ( auto& fl : free_lists )
+	for ( auto& free_list : free_lists )
 	{
-		fl.head.store( { nullptr, 0 }, std::memory_order_relaxed );	 // 设置空头指针 / Set head pointer to null
+		free_list.head.store( { nullptr, 0 }, std::memory_order_relaxed );	// 设置空头指针 / Set head pointer to null
 	}
 
-	/* 释放 chunks / Deallocate chunks */
-	std::lock_guard<std::mutex> this_lock_guard( chunk_mutex );  // 加锁保护 / Lock protection
 	for ( auto& [ pointer, size ] : allocated_chunks )
-		os_memory::deallocate_memory( pointer, size );	// 释放内存 / Deallocate memory
-	allocated_chunks.clear();							// 清空已分配块 / Clear the allocated chunks
+		os_memory::deallocate_tracked( pointer, size );	 // 释放内存 / Deallocate memory
+	allocated_chunks.clear();							 // 清空已分配块 / Clear the allocated chunks
 }
 
 /* =====================================================================
  *  LargeMemoryManager — 实现
  * ===================================================================== */
 
-void* MemoryPool::LargeMemoryManager::allocate( std::size_t bytes )
+void* LargeMemoryManager::allocate( std::size_t bytes, std::size_t alignment = sizeof( std::max_align_t ) )
 {
-	const std::size_t total = sizeof( LargeMemoryHeader ) + bytes;	 // 计算总内存大小 / Calculate total memory size
-	void*			  memory = os_memory::allocate_memory( total );	 // 向操作系统申请内存 / Request memory from the OS
+	const std::size_t total = sizeof( LargeMemoryHeader ) + bytes;				 // 计算总内存大小 / Calculate total memory size
+	void*			  memory = os_memory::allocate_tracked( total, alignment );	 // 向操作系统申请内存 / Request memory from the OS
 	if ( !memory )
 		throw std::bad_alloc();	 // 如果申请失败，抛出异常 / Throw exception if allocation fails
 
@@ -527,13 +660,13 @@ void* MemoryPool::LargeMemoryManager::allocate( std::size_t bytes )
 	header->magic = LargeMemoryHeader::MAGIC;				   // 设置魔法值 / Set magic value
 	header->block_size = bytes;								   // 设置块大小 / Set block size
 
-	std::lock_guard<std::mutex> this_lock_guard( tracking_mutex );  // 加锁保护 / Lock protection
-	active_blocks.push_back( header );				  // 记录已分配的块 / Record the allocated block
+	std::lock_guard<std::mutex> this_lock_guard( tracking_mutex );	// 加锁保护 / Lock protection
+	active_blocks.push_back( header );								// 记录已分配的块 / Record the allocated block
 
 	return header->data();	// 返回数据指针 / Return data pointer
 }
 
-void MemoryPool::LargeMemoryManager::deallocate( LargeMemoryHeader* header )
+void LargeMemoryManager::deallocate( LargeMemoryHeader* header )
 {
 	if ( header->magic != LargeMemoryHeader::MAGIC )
 	{
@@ -543,31 +676,33 @@ void MemoryPool::LargeMemoryManager::deallocate( LargeMemoryHeader* header )
 	header->magic = 0;	// 清除魔法值 / Clear magic value
 
 	{
-		std::lock_guard<std::mutex> this_lock_guard( tracking_mutex );												   // 加锁保护 / Lock protection
-		auto						iter = std::find( active_blocks.begin(), active_blocks.end(), header );  // 查找并删除已释放块 / Find and remove the deallocated block
+		std::lock_guard<std::mutex> this_lock_guard( tracking_mutex );										 // 加锁保护 / Lock protection
+		auto						iter = std::find( active_blocks.begin(), active_blocks.end(), header );	 // 查找并删除已释放块 / Find and remove the deallocated block
 		if ( iter != active_blocks.end() )
-			active_blocks.erase( iter );	// 删除已释放块 / Remove the deallocated block
+			active_blocks.erase( iter );  // 删除已释放块 / Remove the deallocated block
 	}
 
-	os_memory::deallocate_memory( header, sizeof( LargeMemoryHeader ) + header->block_size );  // 释放内存 / Deallocate memory
+	os_memory::deallocate_tracked( header, sizeof( LargeMemoryHeader ) + header->block_size );	// 释放内存 / Deallocate memory
 }
 
-void MemoryPool::LargeMemoryManager::release_resources()
+void LargeMemoryManager::release_resources()
 {
-	std::lock_guard<std::mutex> this_lock_guard( tracking_mutex );  // 加锁保护 / Lock protection
-	for ( auto* header : active_blocks )
-		os_memory::deallocate_memory( header, sizeof( LargeMemoryHeader ) + header->block_size );  // 释放所有已分配的内存 / Deallocate all allocated memory
-	active_blocks.clear();																		   // 清空已分配块 / Clear the allocated blocks
+	{
+		std::scoped_lock<std::mutex> lock( tracking_mutex );
+		for ( auto* header : active_blocks )
+			os_memory::deallocate_tracked( header, sizeof( LargeMemoryHeader ) + header->block_size );	// 释放所有已分配的内存 / Deallocate all allocated memory
+		active_blocks.clear();																			// 清空已分配块 / Clear the allocated blocks
+	}
 }
 
 /* =====================================================================
  *  HugeMemoryManager — 实现
  * ===================================================================== */
 
-void* MemoryPool::HugeMemoryManager::allocate( std::size_t bytes )
+void* HugeMemoryManager::allocate( std::size_t bytes, std::size_t alignment = sizeof( std::max_align_t ) )
 {
-	const std::size_t total = sizeof( HugeMemoryHeader ) + bytes;	 // 计算总内存大小 / Calculate total memory size
-	void*			  memory = os_memory::allocate_memory( total );	 // 向操作系统申请内存 / Request memory from the OS
+	const std::size_t total = sizeof( HugeMemoryHeader ) + bytes;				 // 计算总内存大小 / Calculate total memory size
+	void*			  memory = os_memory::allocate_tracked( total, alignment );	 // 向操作系统申请内存 / Request memory from the OS
 	if ( !memory )
 		throw std::bad_alloc();	 // 如果申请失败，抛出异常 / Throw exception if allocation fails
 
@@ -575,13 +710,13 @@ void* MemoryPool::HugeMemoryManager::allocate( std::size_t bytes )
 	header->magic = HugeMemoryHeader::MAGIC;				  // 设置魔法值 / Set magic value
 	header->block_size = bytes;								  // 设置块大小 / Set block size
 
-	std::lock_guard<std::mutex> this_lock_guard( tracking_mutex );  // 加锁保护 / Lock protection
-	active_blocks.emplace_back( memory, total );	  // 记录已分配的块 / Record the allocated block
+	std::lock_guard<std::mutex> this_lock_guard( tracking_mutex );	// 加锁保护 / Lock protection
+	active_blocks.emplace_back( memory, total );					// 记录已分配的块 / Record the allocated block
 
 	return header->data();	// 返回数据指针 / Return data pointer
 }
 
-void MemoryPool::HugeMemoryManager::deallocate( HugeMemoryHeader* header )
+void HugeMemoryManager::deallocate( HugeMemoryHeader* header )
 {
 	if ( header->magic != HugeMemoryHeader::MAGIC )
 	{
@@ -595,21 +730,23 @@ void MemoryPool::HugeMemoryManager::deallocate( HugeMemoryHeader* header )
 		auto						iter = std::find_if( active_blocks.begin(), active_blocks.end(), [ header ]( auto& reference_object ) { return reference_object.first == header; } );  // 查找并删除已释放块 / Find and remove the deallocated block
 		if ( iter != active_blocks.end() )
 		{
-			os_memory::deallocate_memory( iter->first, iter->second );	// 释放内存 / Deallocate memory
-			active_blocks.erase( iter );								// 删除已释放块 / Remove the deallocated block
+			os_memory::deallocate_tracked( iter->first, iter->second );	 // 释放内存 / Deallocate memory
+			active_blocks.erase( iter );								 // 删除已释放块 / Remove the deallocated block
 			return;
 		}
 	}
 
-	os_memory::deallocate_memory( header, sizeof( HugeMemoryHeader ) + header->block_size );  // 释放内存 / Deallocate memory
+	os_memory::deallocate_tracked( header, sizeof( HugeMemoryHeader ) + header->block_size );  // 释放内存 / Deallocate memory
 }
 
-void MemoryPool::HugeMemoryManager::release_resources()
+void HugeMemoryManager::release_resources()
 {
-	std::lock_guard<std::mutex> lock( tracking_mutex );	 // 加锁保护 / Lock protection
-	for ( auto& [ pointer, size ] : active_blocks )
-		os_memory::deallocate_memory( pointer, size );	// 释放所有已分配的内存 / Deallocate all allocated memory
-	active_blocks.clear();								// 清空已分配块 / Clear the allocated blocks
+	{
+		std::scoped_lock<std::mutex> lock( tracking_mutex );
+		for ( auto& [ pointer, size ] : active_blocks )
+			os_memory::deallocate_tracked( pointer, size );	 // 释放所有已分配的内存 / Deallocate all allocated memory
+		active_blocks.clear();								 // 清空已分配块 / Clear the allocated blocks
+	}
 }
 
 // =====================================================================
@@ -630,162 +767,189 @@ MemoryPool::MemoryPool()
 
 	if ( !construction_warning_shown.exchange( true, std::memory_order_relaxed ) )
 	{
-		std::cerr << "\033[33m[MemoryPool] 直接使用 MemoryPool 仅适合内部场景，生产代码请封装成 PoolAllocator！\033[0m\n";										   // 警告信息 / Warning message
+		std::cerr << "\033[33m[MemoryPool Warning] 直接使用 MemoryPool 仅适合内部场景，生产代码请封装成 PoolAllocator！\033[0m\n";										   // 警告信息 / Warning message
 		std::cerr << "\033[32m[MemoryPool Warning] Direct use of MemoryPool may cause tracking misses or duplicates. Please use PoolAllocator instead!\033[0m\n";  // 警告信息 / Warning message
 	}
 }
 
 MemoryPool::~MemoryPool()
 {
+	/* 1. 标记正在销毁（让各个 manager 在 flush/释放时知道不要往 thread-cache 再放） */
 	is_destructing.store( true, std::memory_order_release );  // 设置销毁标志 / Set destruction flag
-	flush_current_thread_cache();							  // 刷新当前线程缓存 / Flush current thread cache
 
+	/* 2. 刷新本线程的缓存，回收所有没还给 OS 的小/中/大块 */
+	flush_current_thread_cache();  // 刷新当前线程缓存 / Flush current thread cache
+
+	/* 3. 依次释放各等级的剩余资源 */
 	huge_manager.release_resources();	 // 释放超大内存资源 / Release huge memory resources
 	large_manager.release_resources();	 // 释放大内存资源 / Release large memory resources
 	medium_manager.release_resources();	 // 释放中等内存资源 / Release medium memory resources
 	small_manager.release_resources();	 // 释放小内存资源 / Release small memory resources
+
+	/* 4. 最终检查，全局计数器应为 0 */
+	const uint64_t leaked = os_memory::used_memory_bytes_counter.load( std::memory_order_seq_cst );
+	if ( leaked != 0 )
+	{
+		std::cerr << "[MemoryPool] Memory leak detected: " << leaked << " bytes still allocated." << std::endl;
+	}
+
+	/* 5. 检查操作计数，allocate/deallocate 是否成对 */
+	const uint64_t original_point = os_memory::user_operation_counter.load( std::memory_order_seq_cst );
+	if ( original_point != 0 )
+	{
+		std::cerr << "[MemoryPool] Operation imbalance detected: " << original_point << " net operations (allocs minus frees)." << std::endl;
+	}
 }
 
-/* ────────────────────────────────────────────────────────────
- *  1. 统一入口：allocate / Unified entry: allocate
- * ────────────────────────────────────────────────────────────*/
 void* MemoryPool::allocate( std::size_t requested_bytes, std::size_t requested_alignment, const char* file, std::uint32_t line, bool nothrow )
 {
-	// —— 对齐值合法化 / Alignment value legalization ——
-	if ( !is_power_of_two( requested_alignment ) || requested_alignment == 0 || requested_alignment > MAX_ALLOWED_ALIGNMENT )
+	/* ── 1. alignment validation ───────────────────────────── */
+	if ( (requested_alignment & 1) == 1 || !os_memory::memory_pool::is_power_of_two( requested_alignment ))
 	{
-		requested_alignment = DEFAULT_ALIGNMENT;  // 如果不合法则使用默认对齐值 / If invalid, use default alignment
+		if ( requested_alignment > MAX_ALLOWED_ALIGNMENT && !nothrow )
+			throw std::bad_alloc();	 //!< illegal alignment
+
+		if ( requested_alignment > 0 )
+		{
+			requested_alignment = DEFAULT_ALIGNMENT;
+		}
 	}
 
-	// —— 快速路径：≤ DEFAULT_ALIGNMENT 对齐 / Fast path: <= DEFAULT_ALIGNMENT alignment ——
-	if ( requested_alignment <= DEFAULT_ALIGNMENT )
+	/* ── 2. slow path : large alignment ────────────────────── */
+	if ( requested_alignment > DEFAULT_ALIGNMENT )
 	{
-		void* result = nullptr;
-		if ( requested_bytes <= SMALL_BLOCK_MAX_SIZE )
+		const std::size_t extra_alignment_padding_bytes = requested_alignment - 1 + ALIGN_HEADER_BYTES;
+		const std::size_t total_allocated_bytes = requested_bytes + extra_alignment_padding_bytes;
+
+		void* const raw_block_pointer = os_memory::allocate_tracked( total_allocated_bytes, requested_bytes );
+		if ( !raw_block_pointer )
 		{
-			result = small_manager.allocate( requested_bytes );	 // 小块内存分配 / Allocate small block
+			if ( !nothrow )
+				throw std::bad_alloc();
+			return nullptr;
 		}
-		else if ( requested_bytes <= MEDIUM_BLOCK_MAX_SIZE )
+
+		char*		data_region_begin = static_cast<char*>( raw_block_pointer ) + ALIGN_HEADER_BYTES;
+		std::size_t remaining_space_bytes = total_allocated_bytes - ALIGN_HEADER_BYTES;
+		void*		aligned_user_pointer = data_region_begin;
+
+		if ( !std::align( requested_alignment, requested_bytes, aligned_user_pointer, remaining_space_bytes ) )
 		{
-			result = medium_manager.allocate( requested_bytes );  // 中等块内存分配 / Allocate medium block
+			os_memory::deallocate_tracked( raw_block_pointer, total_allocated_bytes );
+			if ( !nothrow )
+				throw std::bad_alloc();
+			return nullptr;
 		}
-		else if ( requested_bytes <= HUGE_BLOCK_THRESHOLD )
-		{
-			result = large_manager.allocate( requested_bytes );	 // 大块内存分配 / Allocate large block
-		}
-		else
-		{
-			result = huge_manager.allocate( requested_bytes );	// 超大块内存分配 / Allocate huge block
-		}
-		return result;
+
+		auto* align_header_pointer = reinterpret_cast<AlignHeader*>( static_cast<char*>( aligned_user_pointer ) - ALIGN_HEADER_BYTES );
+		align_header_pointer->tag = ALIGN_SENTINEL;
+		align_header_pointer->raw = raw_block_pointer;
+		align_header_pointer->size = total_allocated_bytes;
+		return aligned_user_pointer;
 	}
 
-	// —— 慢速路径：> DEFAULT_ALIGNMENT 对齐 / Slow path: > DEFAULT_ALIGNMENT alignment ——
-	const std::size_t header_bytes = sizeof( AlignHeader );									   // 计算对齐头大小 / Calculate alignment header size
-	const std::size_t total_bytes = requested_bytes + requested_alignment - 1 + header_bytes;  // 计算总内存大小 / Calculate total memory size
+	/* ── 3. fast path : default alignment ──────────────────── */
+	const std::size_t total_bytes_including_header = requested_bytes + NOT_ALIGN_HEADER_BYTES;
 
-	// 申请原始块 / Allocate raw block
-	void* raw_block = ( total_bytes <= SMALL_BLOCK_MAX_SIZE ) ? small_manager.allocate( total_bytes ) : os_memory::allocate_memory( total_bytes );
+	std::size_t	  block_header_size_bytes = 0;
+	std::uint32_t block_owner_type_identifier = 0;
+	void*		  internal_data_region_pointer = nullptr;  // → points to data()
 
-	if ( !raw_block )
+	if ( total_bytes_including_header <= SMALL_BLOCK_MAX_SIZE )
+	{
+		block_header_size_bytes = sizeof( SmallMemoryHeader );
+		block_owner_type_identifier = 1;
+		internal_data_region_pointer = small_manager.allocate( total_bytes_including_header, requested_alignment );
+	}
+	else if ( total_bytes_including_header <= MEDIUM_BLOCK_MAX_SIZE )
+	{
+		block_header_size_bytes = sizeof( MediumMemoryHeader );
+		block_owner_type_identifier = 2;
+		internal_data_region_pointer = medium_manager.allocate( total_bytes_including_header, requested_alignment );
+	}
+	else if ( total_bytes_including_header <= HUGE_BLOCK_THRESHOLD )
+	{
+		block_header_size_bytes = sizeof( LargeMemoryHeader );
+		block_owner_type_identifier = 3;
+		internal_data_region_pointer = large_manager.allocate( total_bytes_including_header, requested_alignment );
+	}
+	else
+	{
+		block_header_size_bytes = sizeof( HugeMemoryHeader );
+		block_owner_type_identifier = 4;
+		internal_data_region_pointer = huge_manager.allocate( total_bytes_including_header, requested_alignment );
+	}
+
+	if ( !internal_data_region_pointer )
 	{
 		if ( !nothrow )
-		{
-			throw std::bad_alloc();	 // 申请失败抛出异常 / Throw exception if allocation fails
-		}
-		return nullptr;	 // 如果不抛出异常，则返回空指针 / Return null if not throwing exception
+			throw std::bad_alloc();
+		return nullptr;
 	}
 
-	// 对齐处理 / Alignment handling
-	std::uintptr_t base_address = reinterpret_cast<std::uintptr_t>( raw_block ) + header_bytes;				// 计算对齐后的地址 / Calculate aligned address
-	void*		   aligned_pointer = reinterpret_cast<void*>( align_up( base_address, requested_alignment ) );	// 获取对齐后的指针 / Get the aligned pointer
+	auto* unaligned_block_header = reinterpret_cast<NotAlignHeader*>( internal_data_region_pointer );
+	unaligned_block_header->owner_type = block_owner_type_identifier;
+	unaligned_block_header->raw = static_cast<char*>( internal_data_region_pointer ) - block_header_size_bytes;
 
-	// 设置对齐头 / Set alignment header
-	auto* align_header = reinterpret_cast<AlignHeader*>( static_cast<char*>( aligned_pointer ) - header_bytes );
-	align_header->tag = ALIGN_SENTINEL;												 // 设置标记 / Set sentinel tag
-	align_header->raw = raw_block;													 // 设置原始块指针 / Set raw block pointer
-	align_header->size = ( total_bytes <= SMALL_BLOCK_MAX_SIZE ) ? 0 : total_bytes;	 // 设置块大小 / Set block size
-
-	return aligned_pointer;	 // 返回对齐后的指针 / Return the aligned pointer
+	return static_cast<char*>( internal_data_region_pointer ) + NOT_ALIGN_HEADER_BYTES;
 }
 
+/* -------------------------------------------------------------------------- */
 
-/* ────────────────────────────────────────────────────────────
- *  2. 统一入口：deallocate / Unified entry: deallocate
- * ────────────────────────────────────────────────────────────*/
 void MemoryPool::deallocate( void* user_pointer )
 {
-	// 如果指针为空，直接返回 / If the pointer is null, return immediately
 	if ( !user_pointer )
-	{
 		return;
-	}
 
-	// ① Huge (16 B 头) / Huge (16B header)
-	if ( reinterpret_cast<std::uintptr_t>( user_pointer ) >= sizeof( HugeMemoryHeader ) )
+	const std::uintptr_t user_pointer_address = reinterpret_cast<std::uintptr_t>( user_pointer );
+
+	/* ── 1. check large‑alignment header ───────────────────── */
 	{
-		auto* header = reinterpret_cast<HugeMemoryHeader*>( static_cast<char*>( user_pointer ) - sizeof( HugeMemoryHeader ) );
-		if ( header->magic == HugeMemoryHeader::MAGIC )
+		auto* align_header_pointer = reinterpret_cast<const AlignHeader*>( user_pointer_address - ALIGN_HEADER_BYTES );
+
+		AlignHeader stacked_copy_of_align_header {};
+		std::memcpy( &stacked_copy_of_align_header, align_header_pointer, sizeof( stacked_copy_of_align_header ) );
+
+		if ( stacked_copy_of_align_header.tag == ALIGN_SENTINEL )
 		{
-			huge_manager.deallocate( header );	// 释放超大内存块 / Deallocate huge memory block
+			os_memory::deallocate_tracked( stacked_copy_of_align_header.raw, stacked_copy_of_align_header.size );
 			return;
 		}
 	}
 
-	// ② Large (16 B 头) / Large (16B header)
-	if ( reinterpret_cast<std::uintptr_t>( user_pointer ) >= sizeof( LargeMemoryHeader ) )
+	/* ── 2. check default‑alignment header ─────────────────── */
 	{
-		auto* header = reinterpret_cast<LargeMemoryHeader*>( static_cast<char*>( user_pointer ) - sizeof( LargeMemoryHeader ) );
-		if ( header->magic == LargeMemoryHeader::MAGIC )
+		auto* unaligned_header_pointer = reinterpret_cast<const NotAlignHeader*>( user_pointer_address - NOT_ALIGN_HEADER_BYTES );
+
+		NotAlignHeader stacked_copy_of_unaligned_header {};
+		std::memcpy( &stacked_copy_of_unaligned_header, unaligned_header_pointer, sizeof( stacked_copy_of_unaligned_header ) );
+
+		switch ( stacked_copy_of_unaligned_header.owner_type )
 		{
-			large_manager.deallocate( header );	 // 释放大内存块 / Deallocate large memory block
+		case 1:
+			small_manager.deallocate( static_cast<SmallMemoryHeader*>( stacked_copy_of_unaligned_header.raw ) );
 			return;
+		case 2:
+			medium_manager.deallocate( static_cast<MediumMemoryHeader*>( stacked_copy_of_unaligned_header.raw ) );
+			return;
+		case 3:
+			large_manager.deallocate( static_cast<LargeMemoryHeader*>( stacked_copy_of_unaligned_header.raw ) );
+			return;
+		case 4:
+			huge_manager.deallocate( static_cast<HugeMemoryHeader*>( stacked_copy_of_unaligned_header.raw ) );
+			return;
+		default:
+#if defined( _DEBUG )
+			throw os_memory::bad_dealloc( "deallocate: invalid owner type" );
+#endif
 		}
 	}
 
-	// ③ Medium (24 B 头) / Medium (24B header)
-	if ( reinterpret_cast<std::uintptr_t>( user_pointer ) >= sizeof( MediumMemoryHeader ) )
-	{
-		auto* header = reinterpret_cast<MediumMemoryHeader*>( static_cast<char*>( user_pointer ) - sizeof( MediumMemoryHeader ) );
-		if ( header->magic == MediumMemoryHeader::MAGIC )
-		{
-			medium_manager.deallocate( header );  // 释放中等内存块 / Deallocate medium memory block
-			return;
-		}
-	}
-
-	// ④ Small (24 B 头) / Small (24B header)
-	if ( reinterpret_cast<std::uintptr_t>( user_pointer ) >= sizeof( SmallMemoryHeader ) )
-	{
-		auto* header = reinterpret_cast<SmallMemoryHeader*>( static_cast<char*>( user_pointer ) - sizeof( SmallMemoryHeader ) );
-		if ( header->magic == SmallMemoryHeader::MAGIC )
-		{
-			small_manager.deallocate( header );	 // 释放小内存块 / Deallocate small memory block
-			return;
-		}
-	}
-
-	// ⑤ AlignHeader (对齐头) / AlignHeader (Alignment header)
-	if ( reinterpret_cast<std::uintptr_t>( user_pointer ) >= sizeof( AlignHeader ) )
-	{
-		auto* align_header = reinterpret_cast<AlignHeader*>( static_cast<char*>( user_pointer ) - sizeof( AlignHeader ) );
-		if ( align_header->tag == ALIGN_SENTINEL )
-		{
-			if ( align_header->size == 0 )
-			{
-				auto* header = reinterpret_cast<SmallMemoryHeader*>( static_cast<char*>( align_header->raw ) - sizeof( SmallMemoryHeader ) );
-				small_manager.deallocate( header );  // 释放小内存块 / Deallocate small memory block
-			}
-			else
-			{
-				os_memory::deallocate_memory( align_header->raw, align_header->size );	// 释放原始内存 / Deallocate raw memory
-			}
-			return;
-		}
-	}
-
-	throw std::bad_alloc();	 // 无效指针，抛出异常 / Invalid pointer, throw exception
+#if defined( _DEBUG )
+	throw os_memory::bad_dealloc( "deallocate: invalid pointer" );
+#endif
 }
+
 
 void MemoryPool::flush_current_thread_cache()
 {

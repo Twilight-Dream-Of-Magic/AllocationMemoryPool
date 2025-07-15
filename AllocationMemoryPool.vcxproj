@@ -24,6 +24,7 @@
     <ProjectGuid>{37e7ab43-edce-4f19-a59f-3fdfc89a2a33}</ProjectGuid>
     <RootNamespace>TwilightDreamAllocation</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+    <ProjectName>AllocationMemoryPool</ProjectName>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
@@ -139,6 +140,7 @@
     <ClInclude Include="memory_tracker.hpp" />
     <ClInclude Include="os_memory.hpp" />
     <ClInclude Include="safe_memory_leak_reporter.hpp" />
+    <ClInclude Include="stl_allocator.hpp" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="main.cpp" />

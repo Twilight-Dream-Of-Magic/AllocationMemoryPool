@@ -22,9 +22,6 @@
 
 #include "memory_allocators.hpp"
 
-#include <cstddef>
-#include <type_traits>
-
 namespace os_memory::api
 {
 	using InterfaceAllocator = os_memory::allocator::InterfaceAllocator;

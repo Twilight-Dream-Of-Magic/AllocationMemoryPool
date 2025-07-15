@@ -19,7 +19,13 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cassert>
+
+#include <limits>
 #include <iostream>
+#include <string>
+#include <vector>
+#include <array>
+#include <atomic>
 
 namespace os_memory
 {
@@ -31,25 +37,15 @@ namespace os_memory
 	class bad_dealloc : public std::exception
 	{
 	public:
-		bad_dealloc() 
-		: 
-		exception("bad deallocation", 1) 
-		{
-		}
+		bad_dealloc() : exception( "bad deallocation", 1 ) {}
 
-		explicit bad_dealloc(const std::string& message)
-		:
-		exception(message.c_str(), 1)
-		{
-		}
+		explicit bad_dealloc( const std::string& message ) : exception( message.c_str(), 1 ) {}
 
-		explicit bad_dealloc(const char* message)
-		:
-		exception(message, 1)
-		{
-		}
+		explicit bad_dealloc( const char* message ) : exception( message, 1 ) {}
 	};
 
+	inline std::atomic<uint64_t> used_memory_bytes_counter { 0 };
+	inline std::atomic<uint32_t> user_operation_counter { 0 };
 
 	/*--------------------------------- Linux实现 / Linux Implementation -------*/
 #if defined( __linux__ )
@@ -65,21 +61,19 @@ namespace os_memory
 	 * 2. 大页支持：对齐>4KB时启用巨页 / Hugepage support for alignments >4KB
 	 * 3. 返回原始内存指针 / Returns raw memory pointer
 	 */
-	inline void* allocate_memory( size_t size, size_t alignment = alignof(std::max_align_t) )
+	inline void* allocate_memory( size_t size, size_t alignment = alignof( std::max_align_t ) )
 	{
 		// 配置内存映射标志 / Configure mmap flags
 		const long flags = MAP_PRIVATE | MAP_ANONYMOUS | ( ( alignment > 0x1000 ) ? MAP_HUGETLB : 0 );
 
 		// 直接系统调用：避免libc开销 / Direct syscall: avoids libc overhead
-		const long result = syscall
-		(
-			SYS_mmap,
-			nullptr,				// 地址提示 / address hint
-			size,					// 分配大小 / allocation size
-			PROT_READ | PROT_WRITE, // 读写权限 / read-write protection
-			flags,					// 映射标志 / mapping flags
-			-1,						// 文件描述符 / file descriptor
-			0						// 偏移量 / offset
+		const long result = syscall( SYS_mmap,
+									 nullptr,				  // 地址提示 / address hint
+									 size,					  // 分配大小 / allocation size
+									 PROT_READ | PROT_WRITE,  // 读写权限 / read-write protection
+									 flags,					  // 映射标志 / mapping flags
+									 -1,					  // 文件描述符 / file descriptor
+									 0						  // 偏移量 / offset
 		);
 
 		// 错误处理：直接输出原始错误 / Error handling: outputs raw errno
@@ -101,11 +95,9 @@ namespace os_memory
 	inline bool deallocate_memory( void* raw_pointer, size_t size )
 	{
 		// 直接系统调用解除映射 / Direct syscall unmapping
-		const long result = syscall
-		(
-			SYS_munmap,
-			raw_pointer, // 目标地址 / target address
-			size		 // 释放大小 / deallocation size
+		const long result = syscall( SYS_munmap,
+									 raw_pointer,  // 目标地址 / target address
+									 size		   // 释放大小 / deallocation size
 		);
 
 		// 错误处理 / Error handling
@@ -173,7 +165,7 @@ namespace os_memory
 	 * 1. 使用NT系统调用绕过Win32 API / Uses NT syscall bypassing Win32 API
 	 * 2. 大页支持：对齐>4KB时启用大页 / Large page support for alignments >4KB
 	 */
-	inline void* allocate_memory( size_t size, size_t alignment = alignof(std::max_align_t) )
+	inline void* allocate_memory( size_t size, size_t alignment = alignof( std::max_align_t ) )
 	{
 		void*  base_address = nullptr;
 		SIZE_T allocation_size = size;
@@ -186,14 +178,12 @@ namespace os_memory
 		}
 
 		// 调用NT内存分配函数 / Invoke NT memory allocation
-		const NTSTATUS status = get_nt_allocate_function()
-		(
-			GetCurrentProcess(),  // 当前进程 / current process
-			&base_address,		  // 返回地址 / return address
-			0,					  // 零位掩码 / zero bits mask
-			&allocation_size,	  // 分配大小 / allocation size
-			allocation_type,	  // 分配类型 / allocation type
-			PAGE_READWRITE		  // 内存保护 / memory protection
+		const NTSTATUS status = get_nt_allocate_function()( GetCurrentProcess(),  // 当前进程 / current process
+															&base_address,		  // 返回地址 / return address
+															0,					  // 零位掩码 / zero bits mask
+															&allocation_size,	  // 分配大小 / allocation size
+															allocation_type,	  // 分配类型 / allocation type
+															PAGE_READWRITE		  // 内存保护 / memory protection
 		);
 
 		return NT_SUCCESS( status ) ? base_address : nullptr;
@@ -208,21 +198,51 @@ namespace os_memory
 	inline bool deallocate_memory( void* raw_pointer, size_t size )
 	{
 		SIZE_T		   deallocation_size = size;
-		const NTSTATUS status = get_nt_free_function()
-		(
-			GetCurrentProcess(),  // 当前进程 / current process
-			&raw_pointer,		  // 目标地址 / target address
-			&deallocation_size,	  // 释放大小 / deallocation size
-			MEM_RELEASE			  // 释放类型 / release type
+		const NTSTATUS status = get_nt_free_function()( GetCurrentProcess(),  // 当前进程 / current process
+														&raw_pointer,		  // 目标地址 / target address
+														&deallocation_size,	  // 释放大小 / deallocation size
+														MEM_RELEASE			  // 释放类型 / release type
 		);
 
 		return NT_SUCCESS( status );
 	}
 
+	// ────────────────────────────────────────────────────────────
+	//  计数封装：allocate_tracked / deallocate_tracked
+	//  - 如果分配成功 (ptr != nullptr) →  memory_counter.fetch_add(size)
+	//  - 如果释放成功               →  memory_counter.fetch_sub(size)
+	//  - 计数单位：字节
+	//  - 线程安全：使用 relaxed 语义够用，想更严格自行换成 acq_rel
+	// ────────────────────────────────────────────────────────────
+	inline void* allocate_tracked( size_t size, size_t alignment = alignof( std::max_align_t ) )
+	{
+		void* pointer = allocate_memory( size, alignment );
+		if ( pointer != nullptr )
+		{
+			used_memory_bytes_counter.fetch_add( size, std::memory_order_acq_rel ); // 成功才计数
+			user_operation_counter++;
+		}
+		return pointer;
+	}
+
+	inline bool deallocate_tracked( void* raw_pointer, size_t size )
+	{
+		if ( raw_pointer == nullptr )
+		{
+			return true; // 空指针直接视为成功
+		}
+
+		const bool ok = deallocate_memory( raw_pointer, size );
+		if ( ok )
+		{
+			used_memory_bytes_counter.fetch_sub( size, std::memory_order_acq_rel ); // 只有真正释放成功才扣减
+			user_operation_counter--;
+		}
+		return ok;
+	}
+
 #endif	// 平台选择结束 / End of platform selection
 
 }  // namespace os_memory
-
-
 
 #endif	// OS_MEMORY_HPP
