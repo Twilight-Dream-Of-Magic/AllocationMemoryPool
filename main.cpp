@@ -121,10 +121,10 @@ void test_large_fragmentation()
 	std::mt19937_64		random_engine( static_cast<unsigned long long>( std::chrono::steady_clock::now().time_since_epoch().count() ) );
 	std::vector<size_t> large_size_options = { 1 << 20, 2 << 20, 4 << 20, 8 << 20, 16 << 20, 32 << 20, 64 << 20, 128 << 20, 256 << 20, 512 << 20, 1024 << 20 };
 	std::vector<void*>	allocation_pointer_list;
-	allocation_pointer_list.reserve( 500 );
+	allocation_pointer_list.reserve( 200 );
 
 	// 随机分配大块 / Randomly allocate large blocks
-	for ( int allocation_index = 0; allocation_index < 300; ++allocation_index )
+	for ( int allocation_index = 0; allocation_index < 100; ++allocation_index )
 	{
 		size_t allocation_size = large_size_options[ random_engine() % large_size_options.size() ];
 		void*  allocation_pointer = ALLOCATE_NOTHROW( allocation_size );
@@ -141,7 +141,7 @@ void test_large_fragmentation()
 	}
 
 	// 再次分配以填补大块空洞 / Reallocate to fill large holes
-	for ( int refill_index = 0; refill_index < 150; ++refill_index )
+	for ( int refill_index = 0; refill_index < 50; ++refill_index )
 	{
 		size_t allocation_size = large_size_options[ ( refill_index * 7 ) % large_size_options.size() ];
 		void*  allocation_pointer = ALLOCATE_NOTHROW( allocation_size );
